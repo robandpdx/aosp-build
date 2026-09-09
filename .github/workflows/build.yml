@@ -1,0 +1,113 @@
+name: Build Android OS (AOSP)
+
+on:
+  workflow_dispatch: # Allows manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  build-aosp:
+    # Requires a high-spec self-hosted runner dedicated to AOSP builds
+    # in this case: 32-cores · 128 GB RAM · 1200 GB SSD
+    runs-on: robandpdx-large-x86
+
+    steps:
+      - name: Maximize Disk Space
+        run: |
+          echo "Cleaning up runner environment..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib \
+            gcc-multilib git gnupg gperf lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
+            pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev unzip
+
+      - name: Install ncurses 5 Compatibility Libraries
+        run: |
+          # Ubuntu 24.04 provides ncurses 6, but some AOSP host tools still need ABI 5.
+          version="6.3-2ubuntu0.2"
+          base_url="https://security.ubuntu.com/ubuntu/pool/universe/n/ncurses"
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "$work_dir"' EXIT
+          cd "$work_dir"
+
+          for package in \
+            "libncurses5_${version}_amd64.deb" \
+            "libncurses5_${version}_i386.deb" \
+            "libtinfo5_${version}_amd64.deb" \
+            "libtinfo5_${version}_i386.deb"; do
+            curl --fail --silent --show-error --location --remote-name \
+              "${base_url}/${package}"
+          done
+
+          cat <<'EOF' | sha256sum --check
+          91d18fcc4165a40d27e8181eb282bcaf89c2a5e6c6dc182b37df33827407361c  libncurses5_6.3-2ubuntu0.2_amd64.deb
+          b1d83877cb988b7b98df53a6346358e3435864dfa434c3d990c7232bdc17ac63  libncurses5_6.3-2ubuntu0.2_i386.deb
+          b9bb64e716a7d9de05b1b33992763142ca81bcae3a7f8ce7e29fa3c6fd32f1e8  libtinfo5_6.3-2ubuntu0.2_amd64.deb
+          98bf90d49ed5f8112c8bcb9a4ebe5231f4ce297043d53f35f8e45b28c9fbfe4e  libtinfo5_6.3-2ubuntu0.2_i386.deb
+          EOF
+
+          mkdir extracted
+          for package in ./*.deb; do
+            dpkg-deb --extract "$package" extracted
+          done
+
+          sudo cp --archive extracted/lib/x86_64-linux-gnu/libncurses.so.5* /usr/local/lib/
+          sudo cp --archive extracted/lib/x86_64-linux-gnu/libtinfo.so.5* /usr/local/lib/
+          sudo install --directory /usr/local/lib32
+          sudo cp --archive extracted/lib/i386-linux-gnu/libncurses.so.5* /usr/local/lib32/
+          sudo cp --archive extracted/lib/i386-linux-gnu/libtinfo.so.5* /usr/local/lib32/
+          printf '/usr/local/lib\n/usr/local/lib32\n' | \
+            sudo tee /etc/ld.so.conf.d/aosp-ncurses5.conf >/dev/null
+          sudo ldconfig
+
+      - name: Install Repo Tool
+        run: |
+          sudo apt-get install -y repo
+
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Initialize AOSP Repository
+        run: |
+          mkdir -p android-source
+          cd android-source
+          # Replace with your desired branch/manifest (e.g., Android 14)
+          repo init -u https://android.googlesource.com/platform/manifest -b android-automotiveos-14.0.0_lts7
+
+      # https://source.android.com/docs/setup/download/troubleshoot-sync
+      # To speed up sync, setup a local mirror and mount it in the runner.
+      # This step runs about 1 hour 5 minutes, and is a good candidate for caching of some kind.
+      - name: Sync Source Code
+        run: |
+          cd android-source
+          # Sync can take several hours depending on network speeds
+          repo sync -c -j2 --force-sync --no-clone-bundle --no-tags
+
+      # This step runs about 56 minutes, and is another opportunity to optimize for speed.
+      - name: Setup Build Environment, Lunch Target, and Compile
+        run: |
+          cd android-source
+          source build/envsetup.sh
+          # Replace 'aosp_arm64-eng' with your target device configuration
+          lunch aosp_arm64-eng
+          # Use all available CPU threads for compilation
+          m -j"$(nproc --all)"
+
+      - name: Compress and Upload System Images
+        if: success()
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aosp-build-images
+          path: |
+            android-source/out/target/product/*/*.img
+            android-source/out/target/product/*/*.zip
+          retention-days: 7
